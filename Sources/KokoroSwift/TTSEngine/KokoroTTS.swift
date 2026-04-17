@@ -4,7 +4,7 @@
 import Foundation
 import MLX
 import MLXNN
-import MLXUtilsLibrary
+@_exported import MLXUtilsLibrary
 
 /// Main class that encapsulates the complete Kokoro text-to-speech pipeline.
 ///
