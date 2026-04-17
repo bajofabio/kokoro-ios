@@ -6,6 +6,7 @@
 
 import Foundation
 import eSpeakNGLib
+import MLXUtilsLibrary
 
 /// A G2P processor that uses the eSpeak NG library for phonemization.
 /// Requires the eSpeakNGLib framework to be available at compile time.
