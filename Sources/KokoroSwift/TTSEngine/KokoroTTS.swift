@@ -55,15 +55,23 @@ public final class KokoroTTS {
   
   /// Grapheme-to-phoneme processor for text conversion
   private let g2pProcessor: G2PProcessor?
-  
+
+  /// Secondary G2P processor for languages not handled by the primary.
+  /// When both are set, English uses primary (Misaki), everything else uses secondary (eSpeak).
+  private let g2pProcessorSecondary: G2PProcessor?
+
   /// Currently active language (cached to avoid reinitializing G2P)
   private var chosenLanguage: Language = .none
-  
+
+  /// Which processor is currently active
+  private var activeProcessorIsSecondary: Bool = false
+
   /// Initializes the Kokoro TTS engine with model weights and G2P processor.
   /// - Parameters:
   ///   - modelPath: URL to the directory containing model weights
   ///   - g2p: Grapheme-to-phoneme processor type (default: Misaki)
-  public init(modelPath: URL, g2p: G2P = .misaki) {
+  ///   - g2pSecondary: Optional secondary G2P for non-English languages (typically .eSpeakNG)
+  public init(modelPath: URL, g2p: G2P = .misaki, g2pSecondary: G2P? = nil) {
     // Load and sanitize model weights
     let sanitizedWeights = WeightLoader.loadWeights(modelPath: modelPath)
     let config = KokoroConfig.loadConfig()
@@ -147,6 +155,13 @@ public final class KokoroTTS {
 
     // Initialize G2P processor for text-to-phoneme conversion
     g2pProcessor = try? G2PFactory.createG2PProcessor(engine: g2p)
+
+    // Initialize secondary G2P processor (e.g. eSpeak for non-English)
+    if let secondary = g2pSecondary {
+      g2pProcessorSecondary = try? G2PFactory.createG2PProcessor(engine: secondary)
+    } else {
+      g2pProcessorSecondary = nil
+    }
   }
   
   /// Generates audio from text using the specified voice and parameters.
@@ -228,20 +243,27 @@ public final class KokoroTTS {
   }
   
   /// Updates the G2P language if it differs from the current language.
+  /// Routes English to primary processor (Misaki), other languages to secondary (eSpeak).
   private func updateLanguageIfNeeded(_ language: Language) throws {
     guard chosenLanguage != language else { return }
-    
-    guard let g2pProcessor else {
+
+    let isEnglish = (language == .enUS || language == .enGB)
+    let useSecondary = !isEnglish && g2pProcessorSecondary != nil
+
+    let processor = useSecondary ? g2pProcessorSecondary : g2pProcessor
+    guard let processor else {
       throw G2PProcessorError.processorNotInitialized
     }
-    
-    try g2pProcessor.setLanguage(language)
+
+    try processor.setLanguage(language)
+    activeProcessorIsSecondary = useSecondary
     chosenLanguage = language
   }
-  
-  /// Converts input text to phonemes using the G2P processor.
+
+  /// Converts input text to phonemes using the active G2P processor.
   private func phonemizeText(_ text: String) throws -> (String, [MToken]?) {
-    let phonemizedOutput = try g2pProcessor?.process(input: text)
+    let processor = activeProcessorIsSecondary ? g2pProcessorSecondary : g2pProcessor
+    let phonemizedOutput = try processor?.process(input: text)
     guard let phonemizedOutput else {
       throw G2PProcessorError.processorNotInitialized
     }
