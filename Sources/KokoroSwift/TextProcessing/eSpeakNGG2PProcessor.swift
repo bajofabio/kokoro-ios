@@ -10,20 +10,23 @@ import MLXUtilsLibrary
 
 /// A G2P processor that uses the eSpeak NG library for phonemization.
 /// Requires the eSpeakNGLib framework to be available at compile time.
+/// The eSpeak engine is initialized once and reused — only the language is switched.
 final class eSpeakNGG2PProcessor : G2PProcessor {
   /// The underlying eSpeak NG engine instance.
-  /// This property is initialized when `setLanguage(_:)` is called and remains
-  /// `nil` until the processor is properly configured.
+  /// Initialized once on first setLanguage call and reused for all subsequent calls.
   private var eSpeakEngine: eSpeakNG?
 
   /// Configures the processor for the specified language.
   /// - Parameter language: The target language for phonemization.
   /// - Throws: `G2PProcessorError.unsupportedLanguage` if the language is not supported by eSpeak NG.
   func setLanguage(_ language: Language) throws {
-    eSpeakEngine = try eSpeakNG()
-    
-    if let language = eSpeakNG.Language(rawValue: language.rawValue), let eSpeakEngine {
-      try eSpeakEngine.setLanguage(language: language)
+    // Initialize engine once, then just switch languages
+    if eSpeakEngine == nil {
+      eSpeakEngine = try eSpeakNG()
+    }
+
+    if let lang = eSpeakNG.Language(rawValue: language.rawValue), let eSpeakEngine {
+      try eSpeakEngine.setLanguage(language: lang)
     } else {
       throw G2PProcessorError.unsupportedLanguage
     }
