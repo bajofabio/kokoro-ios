@@ -11,7 +11,11 @@ let package = Package(
   products: [
     .library(
       name: "KokoroSwift",
-      type: .dynamic,
+      // Linkage left automatic (static in practice). Declaring .dynamic made
+      // Xcode build MLXNN into a dynamic framework for this chain while
+      // mlx-swift-lm linked a second copy statically into the app — duplicate
+      // Objective-C classes at launch and two copies of a large ML library
+      // for dyld to map before first frame.
       targets: ["KokoroSwift"]
     ),
   ],
