@@ -27,6 +27,10 @@ public final class KokoroTTS {
   public enum KokoroTTSError: Error {
     /// Thrown when input text exceeds maximum token count
     case tooManyTokens
+    /// Thrown when predicted durations fail validation — the signature of
+    /// computing on arrays poisoned by an aborted Metal command buffer
+    /// (e.g. the app was backgrounded mid-synthesis).
+    case invalidDurations
   }
   
   /// BERT model for encoding phoneme sequences
@@ -190,56 +194,71 @@ public final class KokoroTTS {
 
     // Step 1: Convert text to phonemes
     let (phonemizedText, tokenArray) = try phonemizeText(text)
-    
-    // Step 2: Tokenize and prepare input
-    let (paddedInputIds, attentionMask, inputLengths, textMask, inputIds) = try prepareInputTensors(phonemizedText)
-    
-    // Step 3: Extract style embeddings from voice
-    let (globalStyle, acousticStyle) = extractStyleEmbeddings(from: voice, tokenCount: inputIds.count)
-    
-    // Step 4: Encode text with BERT and predict duration
-    let durationFeatures = encodeBERTAndDuration(
-      inputIds: paddedInputIds,
-      attentionMask: attentionMask,
-      inputLengths: inputLengths,
-      textMask: textMask,
-      style: globalStyle
-    )
-    
-    // Step 5: Predict phoneme durations
-    let (predictedDurations, alignmentTarget) = predictDurations(
-      features: durationFeatures,
-      batchSize: paddedInputIds.shape[1],
-      speed: speed
-    )
-    
-    // Step 6: Generate aligned encodings
-    let alignedEncoding = durationFeatures.transposed(0, 2, 1).matmul(alignmentTarget)
-    
-    // Step 7: Predict prosody (F0, pitch)
-    let (f0Prediction, nPrediction) = prosodyPredictor.F0NTrain(x: alignedEncoding, s: globalStyle)
-    
-    // Step 8: Encode text for decoder
-    let textEncoding = textEncoder(paddedInputIds, inputLengths: inputLengths, m: textMask)
-    let asrFeatures = MLX.matmul(textEncoding, alignmentTarget)
-    
-    // Step 9: Generate audio
-    let audio = decoder(
-      asr: asrFeatures,
-      F0Curve: f0Prediction,
-      N: nPrediction,
-      s: acousticStyle
-    )[0]
-    
-    // Try to predict timestamp of each token if G2P processor returns tokens
-    if let tokenArray {
-      TimestampPredictor.preditTimestamps(tokens: tokenArray, predictionDuration: predictedDurations)
+
+    // The GPU pipeline runs under a scoped MLX error collector. Without it,
+    // an aborted Metal command buffer — e.g. iOS refusing GPU work because
+    // the app moved to the background mid-synthesis
+    // (kIOGPUCommandBufferCallbackErrorBackgroundExecutionNotPermitted) —
+    // is recorded nowhere, the pipeline keeps computing on poisoned arrays,
+    // and the final data read crashes the process instead of throwing
+    // (observed on device 2026-10-15). The explicit check() before
+    // asArray() turns any recorded MLX error into a thrown Swift error the
+    // caller can recover from.
+    let samples: [Float] = try withError { mlxError in
+      // Step 2: Tokenize and prepare input
+      let (paddedInputIds, attentionMask, inputLengths, textMask, inputIds) = try prepareInputTensors(phonemizedText)
+
+      // Step 3: Extract style embeddings from voice
+      let (globalStyle, acousticStyle) = extractStyleEmbeddings(from: voice, tokenCount: inputIds.count)
+
+      // Step 4: Encode text with BERT and predict duration
+      let durationFeatures = encodeBERTAndDuration(
+        inputIds: paddedInputIds,
+        attentionMask: attentionMask,
+        inputLengths: inputLengths,
+        textMask: textMask,
+        style: globalStyle
+      )
+
+      // Step 5: Predict phoneme durations
+      let (predictedDurations, alignmentTarget) = try predictDurations(
+        features: durationFeatures,
+        batchSize: paddedInputIds.shape[1],
+        speed: speed
+      )
+
+      // Step 6: Generate aligned encodings
+      let alignedEncoding = durationFeatures.transposed(0, 2, 1).matmul(alignmentTarget)
+
+      // Step 7: Predict prosody (F0, pitch)
+      let (f0Prediction, nPrediction) = prosodyPredictor.F0NTrain(x: alignedEncoding, s: globalStyle)
+
+      // Step 8: Encode text for decoder
+      let textEncoding = textEncoder(paddedInputIds, inputLengths: inputLengths, m: textMask)
+      let asrFeatures = MLX.matmul(textEncoding, alignmentTarget)
+
+      // Step 9: Generate audio
+      let audio = decoder(
+        asr: asrFeatures,
+        F0Curve: f0Prediction,
+        N: nPrediction,
+        s: acousticStyle
+      )[0]
+
+      // Try to predict timestamp of each token if G2P processor returns tokens
+      if let tokenArray {
+        TimestampPredictor.preditTimestamps(tokens: tokenArray, predictionDuration: predictedDurations)
+      }
+
+      // Any MLX failure above must surface BEFORE reading array data.
+      try mlxError.check()
+      return audio[0].asArray(Float.self)
     }
-    
+
     // Stop performance timing
     BenchmarkTimer.stopTimer(Constants.bm_TTS)
 
-    return (audio[0].asArray(Float.self), tokenArray)
+    return (samples, tokenArray)
   }
   
   /// Updates the G2P language if it differs from the current language.
@@ -356,19 +375,19 @@ public final class KokoroTTS {
   ///   - batchSize: Size of the input batch
   ///   - speed: Speech speed multiplier
   /// - Returns: Predicted durations and alignment target matrix for duration expansion
-  private func predictDurations(features: MLXArray, batchSize: Int, speed: Float) -> (MLXArray, MLXArray) {
+  private func predictDurations(features: MLXArray, batchSize: Int, speed: Float) throws -> (MLXArray, MLXArray) {
     // Pass through LSTM
     let (lstmOutput, _) = predictorLSTM(features)
-    
+
     // Project to duration values
     let durationLogits = durationProj(lstmOutput)
-    
+
     // Convert to actual durations (clamped to minimum of 1 frame)
     let durationSigmoid = MLX.sigmoid(durationLogits).sum(axis: -1) / speed
     let predictedDurations = MLX.clip(durationSigmoid.round(), min: 1).asType(.int32)[0]
-    
+
     // Create alignment matrix
-    return (predictedDurations, createAlignmentTarget(durations: predictedDurations, batchSize: batchSize))
+    return (predictedDurations, try createAlignmentTarget(durations: predictedDurations, batchSize: batchSize))
   }
   
   /// Creates an alignment target matrix from predicted durations. Maps each phoneme to multiple frames based on duration.
@@ -377,24 +396,36 @@ public final class KokoroTTS {
   ///   - durations: Predicted duration for each phoneme
   ///   - batchSize: Size of the input batch
   /// - Returns: Alignment matrix [batchSize × totalFrames]
-  private func createAlignmentTarget(durations: MLXArray, batchSize: Int) -> MLXArray {
-    // Create indices array by repeating each index according to its duration
-    let indices = MLX.concatenated(
-      durations.enumerated().map { index, duration in
-        let frameCount: Int = duration.item()
-        return MLX.repeated(MLXArray([index]), count: frameCount)
-      }
-    )
-
-    // Create one-hot encoded alignment matrix
-    let totalFrames = indices.shape[0]
-    var alignmentArray = [Float](repeating: 0.0, count: totalFrames * batchSize)
-    
-    for frame in 0 ..< totalFrames {
-      let phonemeIndex: Int = indices[frame].item()
-      alignmentArray[phonemeIndex * totalFrames + frame] = 1.0
+  private func createAlignmentTarget(durations: MLXArray, batchSize: Int) throws -> MLXArray {
+    // Materialize the per-phoneme frame counts, then VALIDATE before any
+    // Swift-array math. After an aborted Metal command buffer (e.g. the app
+    // backgrounded mid-synthesis) these values are garbage; unchecked they
+    // index out of bounds or allocate absurd buffers — a process-killing
+    // trap, not a throwable error (crashed on device 2026-10-15). Healthy
+    // values: one count per phoneme, each a handful of 24kHz hop frames.
+    // (This also replaces the old per-frame MLXArray round trips — building
+    // an indices tensor and calling .item() per frame — with plain CPU
+    // arithmetic on the already-materialized counts.)
+    let frameCounts: [Int] = (0 ..< durations.shape[0]).map { durations[$0].item() }
+    let totalFrames = frameCounts.reduce(0, +)
+    guard frameCounts.count == batchSize,
+          frameCounts.allSatisfy({ $0 >= 1 && $0 <= 1_000 }),
+          totalFrames <= 100_000
+    else {
+      throw KokoroTTSError.invalidDurations
     }
-    
+
+    // Create one-hot encoded alignment matrix [batchSize × totalFrames]:
+    // phoneme i owns the run of frames whose length is frameCounts[i].
+    var alignmentArray = [Float](repeating: 0.0, count: totalFrames * batchSize)
+    var frame = 0
+    for (phonemeIndex, count) in frameCounts.enumerated() {
+      for _ in 0 ..< count {
+        alignmentArray[phonemeIndex * totalFrames + frame] = 1.0
+        frame += 1
+      }
+    }
+
     let alignmentTarget = MLXArray(alignmentArray).reshaped([batchSize, totalFrames])
     return alignmentTarget.expandedDimensions(axis: 0)
   }
